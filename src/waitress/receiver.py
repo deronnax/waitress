@@ -16,6 +16,10 @@
 from waitress.rfc7230 import CHUNK_EXT_RE, ONLY_HEXDIG_RE
 from waitress.utilities import BadRequest, find_double_newline
 
+# Control lines exclude CRLF; trailers include their terminating CRLF.
+MAX_CONTROL_LINE = 1024
+MAX_TRAILER = 65536
+
 
 class FixedStreamReceiver:
     # See IStreamConsumer
@@ -67,9 +71,6 @@ class ChunkedReceiver:
     trailer = b""
     completed = False
     error = None
-
-    # max_control_line = 1024
-    # max_trailer = 65536
 
     def __init__(self, buf):
         self.buf = buf
@@ -125,6 +126,12 @@ class ChunkedReceiver:
 
                 if pos < 0:
                     # Control line not finished.
+                    # A trailing CR may be the first byte of the delimiter.
+                    line_size = len(s) - int(s.endswith(b"\r"))
+                    if line_size > MAX_CONTROL_LINE:
+                        self.error = BadRequest("Chunk control line too long")
+                        self.completed = True
+                        break
                     self.control_line = s
                     s = b""
                 else:
@@ -132,6 +139,11 @@ class ChunkedReceiver:
                     line = s[:pos]
                     s = s[pos + 2 :]
                     self.control_line = b""
+
+                    if len(line) > MAX_CONTROL_LINE:
+                        self.error = BadRequest("Chunk control line too long")
+                        self.completed = True
+                        break
 
                     if line:
                         # Begin a new chunk.
@@ -176,6 +188,13 @@ class ChunkedReceiver:
 
                     return orig_size - (len(trailer) - 2)
                 pos = find_double_newline(trailer)
+
+                # When complete, exclude any pipelined request bytes.
+                trailer_size = len(trailer) if pos < 0 else pos
+                if trailer_size > MAX_TRAILER:
+                    self.error = BadRequest("Chunk trailer too long")
+                    self.completed = True
+                    break
 
                 if pos < 0:
                     # Trailer not finished.

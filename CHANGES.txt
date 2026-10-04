@@ -4,6 +4,12 @@
 Backward Incompatibilities
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+- Chunked request control lines are now limited to 1024 bytes excluding CRLF,
+  and trailers to 65536 bytes including their terminating CRLF. Requests that
+  exceed either limit are rejected with a 400 (Bad Request), preventing large
+  amounts of chunk framing from accumulating in memory.
+  See https://github.com/Pylons/waitress/pull/515
+
 - An HTTP/1.1 request that does not contain a Host header field is now rejected
   with a 400 (Bad Request), as required by RFC 9112 section 3.2. A Host header
   field whose value is not a valid ``uri-host [ ":" port ]`` is rejected the

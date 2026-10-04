@@ -82,6 +82,31 @@ class TestChunkedReceiver(unittest.TestCase):
         self.assertEqual(result, 1)
         self.assertFalse(inst.completed)
 
+    def test_received_control_line_too_long(self):
+        from waitress.receiver import MAX_CONTROL_LINE
+        from waitress.utilities import BadRequest
+
+        buf = DummyBuffer()
+        inst = self._makeOne(buf)
+        result = inst.received(b"a" * (MAX_CONTROL_LINE + 1))
+        self.assertEqual(result, MAX_CONTROL_LINE + 1)
+        self.assertTrue(inst.completed)
+        self.assertIsInstance(inst.error, BadRequest)
+        self.assertEqual(inst.error.body, "Chunk control line too long")
+
+    def test_received_control_line_too_long_with_crlf(self):
+        from waitress.receiver import MAX_CONTROL_LINE
+        from waitress.utilities import BadRequest
+
+        buf = DummyBuffer()
+        inst = self._makeOne(buf)
+        data = b"a" * (MAX_CONTROL_LINE + 1) + b"\r\n"
+        result = inst.received(data)
+        self.assertEqual(result, len(data))
+        self.assertTrue(inst.completed)
+        self.assertIsInstance(inst.error, BadRequest)
+        self.assertEqual(inst.error.body, "Chunk control line too long")
+
     def test_received_control_line_finished_garbage_in_input(self):
         buf = DummyBuffer()
         inst = self._makeOne(buf)
@@ -131,6 +156,20 @@ class TestChunkedReceiver(unittest.TestCase):
         result = inst.received(b"a")
         self.assertEqual(result, 1)
         self.assertFalse(inst.completed)
+
+    def test_received_trailer_too_long(self):
+        from waitress.receiver import MAX_TRAILER
+        from waitress.utilities import BadRequest
+
+        buf = DummyBuffer()
+        inst = self._makeOne(buf)
+        inst.all_chunks_received = True
+        inst.trailer = b"x" * MAX_TRAILER
+        result = inst.received(b"y")
+        self.assertEqual(result, 1)
+        self.assertTrue(inst.completed)
+        self.assertIsInstance(inst.error, BadRequest)
+        self.assertEqual(inst.error.body, "Chunk trailer too long")
 
     def test_received_trailer_finished(self):
         buf = DummyBuffer()
@@ -257,6 +296,74 @@ class TestChunkedReceiverParametrized:
         result = inst.received(data)
         assert result == len(data)
         assert inst.error is None
+
+    @pytest.mark.parametrize("digits", [17, 1024])
+    def test_received_chunk_size_with_leading_zeros(self, digits):
+        inst = self._makeOne(DummyBuffer())
+        data = b"0" * (digits - 1) + b"1\r\n"
+        assert inst.received(data) == len(data)
+        assert inst.error is None
+        assert inst.chunk_remainder == 1
+
+    @pytest.mark.parametrize("line_size", [1023, 1024, 1025])
+    def test_control_line_limit_all_splits(self, line_size):
+        from waitress.receiver import MAX_CONTROL_LINE
+        from waitress.utilities import BadRequest
+
+        data = b"1;" + b"a" * (line_size - 2) + b"\r\nx\r\n0\r\n\r\n"
+        for split in range(len(data) + 1):
+            buf = DummyBuffer()
+            inst = self._makeOne(buf)
+            for part in (data[:split], data[split:]):
+                inst.received(part)
+                if inst.error:
+                    break
+            assert inst.completed, split
+            if line_size > MAX_CONTROL_LINE:
+                assert isinstance(inst.error, BadRequest), split
+                assert inst.error.body == "Chunk control line too long"
+            else:
+                assert inst.error is None, split
+                assert b"".join(buf.data) == b"x", split
+
+    @pytest.mark.parametrize("trailer_size", [65535, 65536, 65537])
+    @pytest.mark.parametrize("fragmentation", ["whole", "8192", "terminator"])
+    def test_trailer_limit(self, trailer_size, fragmentation):
+        from waitress.receiver import MAX_TRAILER
+        from waitress.utilities import BadRequest
+
+        inst = self._makeOne(DummyBuffer())
+        inst.received(b"0\r\n")
+        trailer = b"X: " + b"a" * (trailer_size - 7) + b"\r\n\r\n"
+        if fragmentation == "whole":
+            parts = [trailer]
+        elif fragmentation == "8192":
+            parts = [trailer[i : i + 8192] for i in range(0, len(trailer), 8192)]
+        else:
+            parts = [trailer[:-4]] + [bytes([byte]) for byte in trailer[-4:]]
+        for part in parts:
+            inst.received(part)
+            if inst.error:
+                break
+        assert inst.completed
+        if trailer_size > MAX_TRAILER:
+            assert isinstance(inst.error, BadRequest)
+            assert inst.error.body == "Chunk trailer too long"
+        else:
+            assert inst.error is None
+            assert inst.trailer == trailer
+
+    def test_trailer_limit_excludes_next_request(self):
+        from waitress.receiver import MAX_TRAILER
+
+        inst = self._makeOne(DummyBuffer())
+        inst.received(b"0\r\n")
+        trailer = b"X: " + b"a" * (MAX_TRAILER - 7) + b"\r\n\r\n"
+        next_request = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        assert inst.received(trailer + next_request) == len(trailer)
+        assert inst.completed
+        assert inst.error is None
+        assert inst.trailer == trailer
 
     @pytest.mark.parametrize(
         "invalid_size", [b"0x04", b"+0x04", b"x04", b"+04", b" 04", b" 0x04"]
